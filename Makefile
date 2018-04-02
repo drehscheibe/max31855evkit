@@ -1,7 +1,7 @@
 PROJECT=max31855evkit
 
 all: $(PROJECT)
-	./$(PROJECT) -vvv -n1
+	./$(PROJECT) -n1
 
 $(PROJECT): main.o
 	gcc -g -o $(PROJECT) main.o -lm

@@ -69,8 +69,7 @@ static enum {
 } verbose = NORMAL;
 
 
-static bool aborted;
-static bool reset_min_max;
+static int last_signal;
 
 
 static void help()
@@ -78,6 +77,7 @@ static void help()
 	printf("Usage: max31855evkit [-v] [-q] [-d <device>] [-c <filter-coeff>] [-f <format>] [-n <number>] [-i <interval>]\n");
 	printf("       max31855evkit [-h]\n");
 	printf("\n");
+	printf("  -a, --all        use --format '%%t\\t%%C\\t%%T\\t%%F\\t%%I\\t%%A\\n')\n");
 	printf("  -c, --coeff      lowpass (EMWA) filter coefficient (default: 0.1, i.e. 10%% of new plus 90%% of old value; see format %%F)\n");
 	printf("  -d, --device     device file (default: /dev/sensor/DS3900_Module_HIDClass)\n");
 	printf("  -f, --format     print data in this format (default: \"%%t\\t%%.2F\t%%E\\n\")\n");
@@ -96,9 +96,12 @@ static void help()
 	printf("   %%A              maximum filtered linearized temperature (reset by sending SIGUSR1)\n");
 	printf("   %%E              error string\n");
 	printf("   %%t              Unix epoch plus local time offset (for gnuplot; use %%{%%s}t for UTC epoch)\n");
-	printf("   %%{<fmt>}t       date/time in given strftime() format; example %%{%%Y}t for the year\n");
 	printf("   %%n              counter, starting with 0\n");
 	printf("   %%d              degree sign and uppper-case C\n");
+	printf("   %%{<fmt>}t       date/time in given strftime() format; example %%{%%Y}t for the year\n");
+	printf("   %%{<fmt>}$       handle sub-format if no sensor errors\n");
+	printf("   %%{<fmt>}_       handle sub-format in case of sensor errors\n");
+	printf("   %%{<fmt>}<       abort output in case of sensor errors\n");
 	printf("   %%%%              percent sign\n");
 	printf("\n");
 	printf("   \\n, \\t ...      newline, tabulator, etc. as usual (see man ASCII)\n");
@@ -182,7 +185,19 @@ static int print(FILE *stream, const char *f, const struct temp_data_t *t)
 			if (verbose >= DEBUG)
 				fprintf(stream, "\033[90m<<%s|%s|%c>>\033[m", sub, fmt, *f);
 
-			if (*f == '%') {
+			if (*f == '$') {
+				if (!t->u.data.fault)
+					count += print(stream, sub, t);
+
+			} else if (*f == '_') {
+				if (t->u.data.fault)
+					count += print(stream, sub, t);
+
+			} else if (*f == '<') {
+				if (t->u.data.fault)
+					goto out;
+
+			} else if (*f == '%') {
 				putc(*f, stream);
 				count++;
 
@@ -225,6 +240,9 @@ static int print(FILE *stream, const char *f, const struct temp_data_t *t)
 						count += ret;
 				}
 
+			} else if (*f == 'S') {
+				count += fprintf(stream, "0x%08x", t->u.set);
+
 			} else if (*f == 'C') {
 				val = &t->cold_junction_temp;
 
@@ -243,7 +261,7 @@ static int print(FILE *stream, const char *f, const struct temp_data_t *t)
 			} else if (*f == 'A') {
 				val = &t->temp_max;
 
-			} else if (*f == 'e') {
+			} else if (*f == 'E') {
 				const struct max31855_data_t *m = &t->u.data;
 				if (m->fault) // will always be on if any of the following three is
 					printf("fault: ");
@@ -253,6 +271,8 @@ static int print(FILE *stream, const char *f, const struct temp_data_t *t)
 					printf("ground-short ");
 				if (m->supply_short_error)
 					printf("supply-short ");
+			} else {
+				fatal("unknown format letter: %c\n", *f);
 			}
 
 			if (val) {
@@ -273,6 +293,7 @@ static int print(FILE *stream, const char *f, const struct temp_data_t *t)
 			count++;
 		}
 	}
+out:
 	fflush(stream);
 	return count;
 }
@@ -381,6 +402,7 @@ static time_t local_time_offset()
 static int hidwrite(int fd, void *data, size_t len)
 {
 	static uint8_t buf[32] = { 0 };
+	memset(buf, 0, sizeof(buf));
 	strncpy(buf, (uint8_t *)data, len);
 
 	int ret = write(fd, buf, 32);
@@ -420,10 +442,7 @@ static int hidread(int fd, uint32_t *d)
 
 static void irq_handler(int sig)
 {
-	if (sig == SIGUSR1)
-		reset_min_max = true;
-	else
-		aborted = true;
+	last_signal = sig;
 }
 
 
@@ -447,24 +466,31 @@ int main(int argc, char **argv)
 		int option_index = 0;
 
 		static const struct option long_options[] = {
+			{ "all",         no_argument,       0, 'a' },
+			{ "coeff",       required_argument, 0, 'c' },
 			{ "device",      required_argument, 0, 'd' },
 			{ "format",      required_argument, 0, 'f' },
 			{ "help",        no_argument,       0, 'h' },
 			{ "interval",    required_argument, 0, 'i' },
-			{ "lowpass",     required_argument, 0, 'l' },
 			{ "number",      required_argument, 0, 'n' },
 			{ "quiet",       no_argument,       0, 'q' },
 			{ "verbose",     no_argument,       0, 'v' },
 			{ 0,             0,                 0,  0  }
 		};
 
-		c = getopt_long(argc, argv, "d:f:hi:n:qv", long_options, &option_index);
+		c = getopt_long(argc, argv, "ac:d:f:hi:n:qv", long_options, &option_index);
 		if (c == -1)
 			break;
 
 		switch (c) {
+		case 'a':
+			format = "%t\t%C\t%T\t%F\t%I\t%A\n";
+			break;
+
 		case 'c':
-			
+			t.filter_coeff = strtod(optarg, &p);
+			if (!p || *p || t.filter_coeff < 0.0 || t.filter_coeff > 1.0)
+				fatal("bad argument to -c: %lf (must be >= 0 and <= 1\n");
 			break;
 
 		case 'd':
@@ -477,17 +503,13 @@ int main(int argc, char **argv)
 
 		case 'h':
 			help();
-			exit(0);
+			exit(EXIT_SUCCESS);
 			break;
 
 		case 'i':
 			interval = (long)strtoul(optarg, &p, 10) * 1000;
 			if (!p || *p || interval < 0)
 				fatal("bad argument to -i\n");
-			break;
-
-		case 'l':
-			// lowpass filter coefficient
 			break;
 
 		case 'n':
@@ -505,6 +527,7 @@ int main(int argc, char **argv)
 			break;
 
 		case '?':
+			exit(EXIT_FAILURE);
 			break;
 
 		default:
@@ -521,8 +544,25 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);   // Ctrl-c
 	sigaction(SIGQUIT, &sa, NULL);  // Ctrl-\  (prevent segfault)
 	sigaction(SIGUSR1, &sa, NULL);
+	sigaction(SIGALRM, &sa, NULL);
 
-#if 0
+	struct itimerval it_val = {
+		.it_value = {
+			.tv_sec = 0,
+			.tv_usec = 1,
+		},
+		.it_interval = {
+			.tv_sec = interval / 1000000,
+			.tv_usec = interval % 1000000,
+		},
+	};
+
+	if (setitimer(ITIMER_REAL, &it_val, NULL) == -1) {
+		perror("error calling setitimer()");
+		exit(1);
+	}
+
+#if 1
 	fd = open(device, O_RDWR | O_NONBLOCK);
 	if (fd < 0) {
 		perror("Unable to open device");
@@ -531,80 +571,81 @@ int main(int argc, char **argv)
 
 	// the values are taken from the kernel's usbmon output
 	hidwrite(fd, "\xc2", 1);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 
 	hidwrite(fd, "\xc0", 1);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 
 	hidwrite(fd, "\xf3", 1);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 
 	hidwrite(fd, "\xc6\x03", 2);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 
 	hidwrite(fd, "\xeb", 1);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 
 	hidwrite(fd, "\xf6\x01", 2);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 
 	hidwrite(fd, "\xfa", 1);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 
 	hidwrite(fd, "\x30\x02", 2);
-	usleep(100000);
+	usleep(10000);
 	hidread(fd, NULL);
 #endif
 
-	while (!aborted) {
-#if 0
-		hidwrite(fd, "\xf6\x01", 2);
-		usleep(10000);
-		hidread(fd, NULL);
+	while (number < 0 || number--) {
+		pause();
 
-		hidwrite(fd, "\xf6\x00", 2);
-		usleep(10000);
-		hidread(fd, NULL);
-
-		// this was a changing value in the usbmon log, but this works, too
-		hidwrite(fd, "\x31\x04\x80\xef\x12", 5);
-		usleep(10000);
-		hidread(fd, &t.u.set);
-#else
-		if (reset_min_max) {
-			t.temp_min = +INFINITY;
-			t.temp_max = -INFINITY;
-			reset_min_max = false;
-		}
-
-		t.u.set = 0x01741a30;
-		process(&t);
-		if (print(stdout, format, &t) < 0)
-			number = 1;
-		t.counter++;
-#endif
-
-#if 0
-		hidwrite(fd, "\xf6\x01", 2);
-		usleep(10000);
-		hidread(fd, NULL);
-#endif
-
-		if (number > 0 && !--number)
+		if (last_signal == SIGINT || last_signal == SIGQUIT) {
 			break;
 
-		usleep(interval - 40000);
+		} else if (last_signal == SIGUSR1) {
+			t.temp_min = +INFINITY;
+			t.temp_max = -INFINITY;
+
+		} else if (last_signal == SIGALRM) {
+#if 1
+			hidwrite(fd, "\xf6\x01", 2);
+			usleep(10000);
+			hidread(fd, NULL);
+
+			hidwrite(fd, "\xf6\x00", 2);
+			usleep(10000);
+			hidread(fd, NULL);
+
+			// this was a changing value in the usbmon log, but this works, too
+			hidwrite(fd, "\x31\x04\x80\xef\x12", 5);
+			usleep(10000);
+			hidread(fd, &t.u.set);
+#else
+			t.u.set = 0x01741a30;
+#endif
+			process(&t);
+//			fprintf(stderr, "%x\n", t.u.set);
+			if (print(stdout, format, &t) < 0)
+				fatal("foo\n");
+			t.counter++;
+
+#if 1
+			hidwrite(fd, "\xf6\x01", 2);
+			usleep(10000);
+			hidread(fd, NULL);
+#endif
+		} else {
+			fprintf(stderr, "this can't happen: %d\n", last_signal);
+		}
 	}
 
-	if (aborted)
-		putc('\n', stdout);
 	close(fd);
 	return 0;
 }
