@@ -97,7 +97,6 @@ static void help()
 	printf("   %%E              error string\n");
 	printf("   %%t              Unix epoch plus local time offset (for gnuplot; use %%{%%s}t for UTC epoch)\n");
 	printf("   %%n              counter, starting with 0\n");
-	printf("   %%d              degree sign and uppper-case C\n");
 	printf("   %%{<fmt>}t       date/time in given strftime() format; example %%{%%Y}t for the year\n");
 	printf("   %%{<fmt>}$       handle sub-format if no sensor errors\n");
 	printf("   %%{<fmt>}_       handle sub-format in case of sensor errors\n");
@@ -199,10 +198,6 @@ static int print(FILE *stream, const char *f, const struct temp_data_t *t)
 
 			} else if (*f == '%') {
 				putc(*f, stream);
-				count++;
-
-			} else if (*f == 'd') {
-				fputs("\xb0" "C", stream); // degree celsius
 				count++;
 
 			} else if (*f == 'n') {
